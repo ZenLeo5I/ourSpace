@@ -1,5 +1,6 @@
 import { GameClient } from "../game";
 import { Player } from "../../common";
+import { Button } from "../../client/ui-elements";
 import {
     MC2D_CHUNK_SIZE,
     MC2D_MATCH_DURATION_SECONDS,
@@ -380,6 +381,7 @@ export class MinecraftDiamondRushClient extends GameClient {
     camera: { x: number; y: number; zoom: number };
     wantsExit: boolean;
     disposed: boolean;
+    exitButton: Button;
 
     constructor(userInput: UserInput, myId: string) {
         super(userInput, myId);
@@ -396,6 +398,10 @@ export class MinecraftDiamondRushClient extends GameClient {
         this.camera = { x: 0, y: 0, zoom: 1 };
         this.wantsExit = false;
         this.disposed = false;
+        this.exitButton = new Button("Torna alla lobby", this.userInput, () => {
+            this.wantsExit = true;
+        });
+        this.exitButton.setColors({ main: "#2563eb" });
     }
 
     init(players: Record<string, Player>): void {
@@ -408,20 +414,23 @@ export class MinecraftDiamondRushClient extends GameClient {
             return;
         }
 
-        const frameMessages = this.collectInputMessages();
-        this.networkQueue.enqueueMany(frameMessages);
-        this.interpolator.step(dt, this.myId);
         const players = this.interpolator.getPlayers();
         const me = players[this.myId];
 
-        if (me) {
-            const follow = Math.min(1, dt * 10);
-            this.camera.x = this.camera.x + (me.x - this.camera.x) * follow;
-            this.camera.y = this.camera.y + (me.y - this.camera.y) * follow;
-        }
+        if (!this.summary) {
+            const frameMessages = this.collectInputMessages();
+            this.networkQueue.enqueueMany(frameMessages);
+            this.interpolator.step(dt, this.myId);
 
-        this.updatePointerState(me);
-        this.networkQueue.enqueueMany(this.collectPointerMessages());
+            if (me) {
+                const follow = Math.min(1, dt * 10);
+                this.camera.x = this.camera.x + (me.x - this.camera.x) * follow;
+                this.camera.y = this.camera.y + (me.y - this.camera.y) * follow;
+            }
+
+            this.updatePointerState(me);
+            this.networkQueue.enqueueMany(this.collectPointerMessages());
+        }
 
         this.renderer.drawWorld(
             ctx,
@@ -461,7 +470,7 @@ export class MinecraftDiamondRushClient extends GameClient {
     }
 
     isFinished(): boolean {
-        return false;
+        return this.wantsExit;
     }
 
     collectInputMessages(): any[] {
@@ -714,6 +723,12 @@ export class MinecraftDiamondRushClient extends GameClient {
             ? "A diamond has been mined"
             : "Time up, nearest to diamond wins", this.userInput.screenW / 2, this.userInput.screenH / 2 + 20);
         ctx.fillText("Match over", this.userInput.screenW / 2, this.userInput.screenH / 2 + 56);
+
+        const buttonW = Math.min(300, this.userInput.screenW - 48);
+        const buttonH = 52;
+        const buttonX = this.userInput.screenW / 2 - buttonW / 2;
+        const buttonY = this.userInput.screenH / 2 + 92;
+        this.exitButton.draw(ctx, buttonX, buttonY, buttonW, buttonH);
     }
 
     drawWaitingScreen(ctx: CanvasRenderingContext2D): void {
