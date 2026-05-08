@@ -11,16 +11,18 @@ import {
     MC2D_WORLD_MIN_Y
 } from "./constants";
 import { BlockType, Chunk, TilePos } from "./types";
-import { chunkCoordFromTile, seededNoise } from "./utils";
+import { floorDiv, seededNoise } from "./utils";
 
 const CHUNK_RADIUS_X = 4;
 const CHUNK_RADIUS_Y = 3;
+const WORLD_W = MC2D_WORLD_MAX_X - MC2D_WORLD_MIN_X + 1;
+const CHUNK_TILE_COUNT = MC2D_CHUNK_SIZE * MC2D_CHUNK_SIZE;
 
 export class MinecraftWorld {
     seed: number;
     diamondPos: TilePos;
     diamondRevealed: boolean;
-    overrides: Map<string, BlockType>;
+    overrides: Map<number, BlockType>;
 
     constructor(seed: number) {
         this.seed = seed;
@@ -34,8 +36,7 @@ export class MinecraftWorld {
         if (tileY < MC2D_WORLD_MIN_Y) return "stone";
         if (tileY > MC2D_WORLD_MAX_Y) return "air";
 
-        const key = this.tileKey(tileX, tileY);
-        const edited = this.overrides.get(key);
+        const edited = this.overrides.get(this.tileKey(tileX, tileY));
         if (edited) return edited;
 
         if (tileX === this.diamondPos.x && tileY === this.diamondPos.y) {
@@ -75,25 +76,31 @@ export class MinecraftWorld {
     }
 
     getChunksAround(tileX: number, tileY: number): Chunk[] {
-        const centerChunk = chunkCoordFromTile(tileX, tileY);
-        const chunks: Chunk[] = [];
+        const centerChunkX = floorDiv(tileX, MC2D_CHUNK_SIZE);
+        const centerChunkY = floorDiv(tileY, MC2D_CHUNK_SIZE);
+        const w = CHUNK_RADIUS_X * 2 + 1;
+        const h = CHUNK_RADIUS_Y * 2 + 1;
+        const chunks = new Array<Chunk>(w * h);
+
+        let i = 0;
         for (let dy = -CHUNK_RADIUS_Y; dy <= CHUNK_RADIUS_Y; dy += 1) {
             for (let dx = -CHUNK_RADIUS_X; dx <= CHUNK_RADIUS_X; dx += 1) {
-                const cx = centerChunk.chunkX + dx;
-                const cy = centerChunk.chunkY + dy;
-                chunks.push(this.buildChunkForClient(cx, cy));
+                chunks[i++] = this.buildChunkForClient(centerChunkX + dx, centerChunkY + dy);
             }
         }
+
         return chunks;
     }
 
     buildChunkForClient(chunkX: number, chunkY: number): Chunk {
-        const tiles: BlockType[] = [];
+        const tiles = new Array<BlockType>(CHUNK_TILE_COUNT);
+        let i = 0;
+        const baseX = chunkX * MC2D_CHUNK_SIZE;
+        const baseY = chunkY * MC2D_CHUNK_SIZE;
         for (let localY = 0; localY < MC2D_CHUNK_SIZE; localY += 1) {
+            const tileY = baseY + localY;
             for (let localX = 0; localX < MC2D_CHUNK_SIZE; localX += 1) {
-                const tileX = chunkX * MC2D_CHUNK_SIZE + localX;
-                const tileY = chunkY * MC2D_CHUNK_SIZE + localY;
-                tiles.push(this.getBlockForClient(tileX, tileY));
+                tiles[i++] = this.getBlockForClient(baseX + localX, tileY);
             }
         }
         return {
@@ -161,7 +168,7 @@ export class MinecraftWorld {
             && tileY <= MC2D_WORLD_MAX_Y;
     }
 
-    tileKey(tileX: number, tileY: number): string {
-        return `${tileX}:${tileY}`;
+    tileKey(tileX: number, tileY: number): number {
+        return (tileY - MC2D_WORLD_MIN_Y) * WORLD_W + (tileX - MC2D_WORLD_MIN_X);
     }
 }

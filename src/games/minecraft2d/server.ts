@@ -92,9 +92,10 @@ export class MinecraftDiamondRushServer extends GameServer {
         this.forceSnapshot = true;
         this.pendingBlockUpdates = [];
 
-        const entries = Object.entries(players);
         this.players = {};
-        entries.forEach(([id, player], index) => {
+        let index = 0;
+        for (const id in players) {
+            const player = players[id];
             const spawnX = -6 + index * 3;
             const spawnY = 6;
             this.players[id] = {
@@ -119,7 +120,8 @@ export class MinecraftDiamondRushServer extends GameServer {
                 selectedPlaceable: "dirt",
                 inventory: createEmptyInventory()
             };
-        });
+            index += 1;
+        }
     }
 
     tick(incomingMessages: { clientId: string; payload: any }[], dt: number): { clientId?: string; payload: any }[] {
@@ -131,12 +133,16 @@ export class MinecraftDiamondRushServer extends GameServer {
         }
 
         const messages: { clientId?: string; payload: any }[] = [];
+        const blockUpdates = this.pendingBlockUpdates;
         const publicPlayers = this.getPublicPlayers();
         const shouldSendSnapshot = this.forceSnapshot
             || (this.tickCounter % MC2D_SNAPSHOT_INTERVAL_TICKS === 0)
             || this.summary !== null;
 
-        Object.keys(this.players).forEach((playerId) => {
+        const includeDiamondPos = this.world.diamondRevealed || !!this.summary;
+        const diamondPos = includeDiamondPos ? { ...this.world.diamondPos } : undefined;
+
+        for (const playerId in this.players) {
             const self = this.players[playerId];
             const delta: GameDelta = {
                 kind: "delta",
@@ -146,11 +152,9 @@ export class MinecraftDiamondRushServer extends GameServer {
                 summary: this.summary,
                 players: publicPlayers,
                 self: toPrivatePlayerState(self),
-                blockUpdates: [...this.pendingBlockUpdates]
+                blockUpdates
             };
-            if (this.world.diamondRevealed || this.summary) {
-                delta.diamondPos = { ...this.world.diamondPos };
-            }
+            if (diamondPos) delta.diamondPos = diamondPos;
 
             messages.push({
                 clientId: playerId,
@@ -169,15 +173,13 @@ export class MinecraftDiamondRushServer extends GameServer {
                     self: toPrivatePlayerState(self),
                     chunks: this.world.getChunksAround(Math.floor(self.x), Math.floor(self.y))
                 };
-                if (this.world.diamondRevealed || this.summary) {
-                    snapshot.diamondPos = { ...this.world.diamondPos };
-                }
+                if (diamondPos) snapshot.diamondPos = diamondPos;
                 messages.push({
                     clientId: playerId,
                     payload: snapshot
                 });
             }
-        });
+        }
 
         this.pendingBlockUpdates = [];
         this.forceSnapshot = false;
@@ -190,25 +192,26 @@ export class MinecraftDiamondRushServer extends GameServer {
     }
 
     handleIncomingMessages(messages: { clientId: string; payload: any }[], nowMs: number): void {
-        messages.forEach((message) => {
+        for (let i = 0; i < messages.length; i += 1) {
+            const message = messages[i];
             const player = this.players[message.clientId];
-            if (!player) return;
+            if (!player) continue;
 
             const payload = message.payload;
             if (payload.kind === "input") {
                 player.input.left = !!payload.left;
                 player.input.right = !!payload.right;
                 player.input.jump = !!payload.jump;
-                return;
+                continue;
             }
 
-            if (player.dead) return;
+            if (player.dead) continue;
 
             if (payload.kind === "mine_start") {
                 const target = sanitizeTile(payload.target);
-                if (!this.canReachTile(player, target)) return;
-                if (this.world.getBlock(target.x, target.y) === "air") return;
-                if (player.mining && sameTile(player.mining.target, target)) return;
+                if (!this.canReachTile(player, target)) continue;
+                if (this.world.getBlock(target.x, target.y) === "air") continue;
+                if (player.mining && sameTile(player.mining.target, target)) continue;
                 player.mining = {
                     target,
                     elapsedSeconds: 0
@@ -224,20 +227,21 @@ export class MinecraftDiamondRushServer extends GameServer {
             } else if (payload.kind === "place_block") {
                 this.tryPlaceBlock(player, sanitizeTile(payload.target), payload.block);
             }
-        });
+        }
     }
 
     simulatePlayers(dt: number, nowMs: number): void {
-        Object.values(this.players).forEach((player) => {
+        for (const id in this.players) {
+            const player = this.players[id];
             if (player.dead) {
                 if (nowMs >= player.respawnAtMs) {
                     this.respawnPlayer(player);
                 }
-                return;
+                continue;
             }
             stepPlayerPhysics(player, player.input, this.world, dt, 1);
             this.processMining(player, dt);
-        });
+        }
     }
 
     processMining(player: ServerPlayerState, dt: number): void {
@@ -263,7 +267,7 @@ export class MinecraftDiamondRushServer extends GameServer {
         if (!result) return;
 
         this.pendingBlockUpdates.push({
-            pos: { ...target },
+            pos: target,
             block: "air"
         });
 
@@ -288,17 +292,18 @@ export class MinecraftDiamondRushServer extends GameServer {
 
         let nearest: ServerPlayerState | null = null;
         let nearestDist = Number.POSITIVE_INFINITY;
-        Object.values(this.players).forEach((candidate) => {
-            if (candidate.id === attacker.id || candidate.dead) return;
+        for (const id in this.players) {
+            const candidate = this.players[id];
+            if (candidate.id === attacker.id || candidate.dead) continue;
             const dx = candidate.x - attacker.x;
             const dy = candidate.y - attacker.y;
             const distanceSq = dx * dx + dy * dy;
-            if (distanceSq > reachSq) return;
+            if (distanceSq > reachSq) continue;
             if (distanceSq < nearestDist) {
                 nearestDist = distanceSq;
                 nearest = candidate;
             }
-        });
+        }
 
         if (!nearest) return;
 
@@ -349,7 +354,7 @@ export class MinecraftDiamondRushServer extends GameServer {
 
         player.inventory[inventoryKey] -= 1;
         this.pendingBlockUpdates.push({
-            pos: { ...target },
+            pos: target,
             block
         });
     }
@@ -415,8 +420,9 @@ export class MinecraftDiamondRushServer extends GameServer {
     }
 
     canReachTile(player: ServerPlayerState, tile: TilePos): boolean {
-        const center = { x: tile.x + 0.5, y: tile.y + 0.5 };
-        return distSq(player, center) <= miningReachSq;
+        const dx = player.x - (tile.x + 0.5);
+        const dy = player.y - (tile.y + 0.5);
+        return dx * dx + dy * dy <= miningReachSq;
     }
 
     targetCollidesWithAnyPlayer(tile: TilePos): boolean {
@@ -424,23 +430,23 @@ export class MinecraftDiamondRushServer extends GameServer {
         const tileRight = tile.x + 1;
         const tileBottom = tile.y;
         const tileTop = tile.y + 1;
-        return Object.values(this.players).some((player) => {
+        for (const id in this.players) {
+            const player = this.players[id];
             const left = player.x - MC2D_PLAYER_HALF_WIDTH;
             const right = player.x + MC2D_PLAYER_HALF_WIDTH;
             const bottom = player.y - MC2D_PLAYER_HALF_HEIGHT;
             const top = player.y + MC2D_PLAYER_HALF_HEIGHT;
-            return left < tileRight
+            if (left < tileRight
                 && right > tileLeft
                 && bottom < tileTop
-                && top > tileBottom;
-        });
+                && top > tileBottom) return true;
+        }
+        return false;
     }
 
     getPublicPlayers(): Record<string, PublicPlayerState> {
         const output: Record<string, PublicPlayerState> = {};
-        Object.values(this.players).forEach((player) => {
-            output[player.id] = toPublicPlayerState(player);
-        });
+        for (const id in this.players) output[id] = toPublicPlayerState(this.players[id]);
         return output;
     }
 }
