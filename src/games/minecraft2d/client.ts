@@ -8,8 +8,8 @@ import {
     MC2D_TILE_SIZE_PX
 } from "./constants";
 import { MC2D_RECIPE_BY_ID, MC2D_RECIPES } from "./recipes";
-import { chunkCoordFromTile, chunkKey, distSq, lerp, localTileIndex, sameTile } from "./utils";
-import { BlockType, ClientPlayerState, Chunk, GameDelta, GameMessage, GameSnapshot, PlaceableBlock, PrivatePlayerState, PublicPlayerState, TilePos } from "./types";
+import { chunkKey, floorDiv, lerp, localTileIndex, sameTile } from "./utils";
+import { BlockType, ClientPlayerState, Chunk, GameDelta, GameMessage, GameSnapshot, Inventory, PlaceableBlock, PrivatePlayerState, PublicPlayerState, TilePos } from "./types";
 import { LobbyPlayer } from "./types";
 import { UserInput } from "../../client/user-input";
 
@@ -32,6 +32,39 @@ const BLOCK_LABELS: Record<string, string> = {
     diamond: "Diamond"
 };
 
+const MINING_REACH_SQ = MC2D_MINING_REACH * MC2D_MINING_REACH;
+const BASE_CONTROLS = [
+    "A/D move",
+    "W or Space jump",
+    "Mouse aim",
+    "left click mine",
+    "right click place",
+    "F attack",
+    "Z/X/C select block",
+    "1-5 craft"
+] as const;
+
+const MATERIAL_LABEL: Record<string, string> = {
+    wood: "Wood",
+    stone: "Stone",
+    trunk: "Trunk",
+    iron: "Iron",
+    dirt: "Dirt",
+    diamond: "Diamond"
+};
+
+const formatMaterialName = (material: string): string => MATERIAL_LABEL[material] ?? material;
+
+const RECIPE_REQUIRES: Record<string, readonly (readonly [keyof Inventory, number])[]> = {};
+const RECIPE_MATERIALS_TEXT: Record<string, string> = {};
+
+for (let i = 0; i < MC2D_RECIPES.length; i += 1) {
+    const recipe = MC2D_RECIPES[i];
+    const requires = Object.entries(recipe.requires) as [keyof Inventory, number][];
+    RECIPE_REQUIRES[recipe.id] = requires;
+    RECIPE_MATERIALS_TEXT[recipe.id] = requires.map(([material, amount]) => `${formatMaterialName(material)} x${amount}`).join("  ");
+}
+
 class ClientMessageQueue {
     queue: any[];
 
@@ -44,7 +77,7 @@ class ClientMessageQueue {
     }
 
     enqueueMany(messages: any[]): void {
-        messages.forEach((message) => this.queue.push(message));
+        for (let i = 0; i < messages.length; i += 1) this.queue.push(messages[i]);
     }
 
     flush(): any[] {
@@ -62,46 +95,42 @@ class PlayerInterpolator {
     }
 
     sync(networkPlayers: Record<string, PublicPlayerState>): void {
-        Object.entries(networkPlayers).forEach(([id, networkPlayer]) => {
+        for (const id in networkPlayers) {
+            const incoming = networkPlayers[id];
             const existing = this.players[id];
             if (!existing) {
-                this.players[id] = {
-                    ...networkPlayer,
-                    targetX: networkPlayer.x,
-                    targetY: networkPlayer.y
-                };
-                return;
+                this.players[id] = { ...incoming, targetX: incoming.x, targetY: incoming.y };
+                continue;
             }
 
-            existing.name = networkPlayer.name;
-            existing.skin = networkPlayer.skin;
-            existing.vx = networkPlayer.vx;
-            existing.vy = networkPlayer.vy;
-            existing.facing = networkPlayer.facing;
-            existing.hp = networkPlayer.hp;
-            existing.maxHp = networkPlayer.maxHp;
-            existing.dead = networkPlayer.dead;
-            existing.targetX = networkPlayer.x;
-            existing.targetY = networkPlayer.y;
-        });
+            existing.name = incoming.name;
+            existing.skin = incoming.skin;
+            existing.vx = incoming.vx;
+            existing.vy = incoming.vy;
+            existing.facing = incoming.facing;
+            existing.hp = incoming.hp;
+            existing.maxHp = incoming.maxHp;
+            existing.dead = incoming.dead;
+            existing.targetX = incoming.x;
+            existing.targetY = incoming.y;
+        }
 
-        Object.keys(this.players).forEach((id) => {
-            if (!networkPlayers[id]) delete this.players[id];
-        });
+        for (const id in this.players) if (!networkPlayers[id]) delete this.players[id];
     }
 
     step(dt: number, myId: string): void {
         const alpha = Math.min(1, dt * 12);
-        Object.values(this.players).forEach((player) => {
+        for (const id in this.players) {
+            const player = this.players[id];
             if (player.id === myId) {
                 player.x = player.targetX;
                 player.y = player.targetY;
-                return;
+                continue;
             }
 
             player.x = lerp(player.x, player.targetX, alpha);
             player.y = lerp(player.y, player.targetY, alpha);
-        });
+        }
     }
 
     getPlayers(): Record<string, ClientPlayerState> {
@@ -114,9 +143,8 @@ class MinecraftInputController {
     jumpHeld: boolean;
     leftMouseDown: boolean;
     rightClickRequested: boolean;
-    exitRequested: boolean;
     lastMiningTarget: TilePos | null;
-    pointerTile: TilePos | null;
+    pointerTile: TilePos;
     oneShotMessages: any[];
     onKeyDown: (event: KeyboardEvent) => void;
     onKeyUp: (event: KeyboardEvent) => void;
@@ -129,9 +157,8 @@ class MinecraftInputController {
         this.jumpHeld = false;
         this.leftMouseDown = false;
         this.rightClickRequested = false;
-        this.exitRequested = false;
         this.lastMiningTarget = null;
-        this.pointerTile = null;
+        this.pointerTile = { x: 0, y: 0 };
         this.oneShotMessages = [];
 
         this.onKeyDown = (event) => {
@@ -171,54 +198,7 @@ class MinecraftInputController {
         this.userInput.canvas.addEventListener("contextmenu", this.onContextMenu);
     }
 
-    collectFrameMessages(camera: { x: number; y: number; zoom: number }, selectedPlaceable: PlaceableBlock): any[] {
-        this.pointerTile = this.screenToTile(camera);
-        const left = this.userInput.moveDirectionX < -0.1;
-        const right = this.userInput.moveDirectionX > 0.1;
-        const jump = this.jumpHeld || this.userInput.moveDirectionY < -0.1;
-
-        const frameMessages: any[] = [{
-            kind: "input",
-            left,
-            right,
-            jump
-        }];
-
-        frameMessages.push(...this.oneShotMessages);
-        this.oneShotMessages = [];
-
-        if (this.leftMouseDown && this.pointerTile) {
-            if (!this.lastMiningTarget || !sameTile(this.pointerTile, this.lastMiningTarget)) {
-                frameMessages.push({
-                    kind: "mine_start",
-                    target: { ...this.pointerTile }
-                });
-                this.lastMiningTarget = { ...this.pointerTile };
-            }
-        } else if (this.lastMiningTarget) {
-            frameMessages.push({ kind: "mine_stop" });
-            this.lastMiningTarget = null;
-        }
-
-        if (this.rightClickRequested && this.pointerTile) {
-            frameMessages.push({
-                kind: "place_block",
-                target: { ...this.pointerTile },
-                block: selectedPlaceable
-            });
-        }
-
-        this.rightClickRequested = false;
-        return frameMessages;
-    }
-
-    consumeExitRequested(): boolean {
-        if (!this.exitRequested) return false;
-        this.exitRequested = false;
-        return true;
-    }
-
-    getPointerTile(): TilePos | null {
+    getPointerTile(): TilePos {
         return this.pointerTile;
     }
 
@@ -272,22 +252,13 @@ class MinecraftInputController {
             });
         }
     }
-
-    screenToTile(camera: { x: number; y: number; zoom: number }): TilePos {
-        const worldX = (this.userInput.mouseX - this.userInput.screenW / 2)
-            / (MC2D_TILE_SIZE_PX * camera.zoom)
-            + camera.x;
-        const worldY = -((this.userInput.mouseY - this.userInput.screenH / 2)
-            / (MC2D_TILE_SIZE_PX * camera.zoom))
-            + camera.y;
-        return {
-            x: Math.floor(worldX),
-            y: Math.floor(worldY)
-        };
-    }
 }
 
 class PixelRenderer {
+    private skyCtx: CanvasRenderingContext2D | null = null;
+    private skyH = 0;
+    private sky: CanvasGradient | null = null;
+
     drawWorld(
         ctx: CanvasRenderingContext2D,
         screenW: number,
@@ -313,32 +284,45 @@ class PixelRenderer {
     }
 
     drawBackground(ctx: CanvasRenderingContext2D, screenW: number, screenH: number): void {
-        const sky = ctx.createLinearGradient(0, 0, 0, screenH);
-        sky.addColorStop(0, "#77bde0");
-        sky.addColorStop(0.52, "#4d8db3");
-        sky.addColorStop(1, "#16202b");
-        ctx.fillStyle = sky;
+        if (!this.sky || this.skyH !== screenH || this.skyCtx !== ctx) {
+            const sky = ctx.createLinearGradient(0, 0, 0, screenH);
+            sky.addColorStop(0, "#77bde0");
+            sky.addColorStop(0.52, "#4d8db3");
+            sky.addColorStop(1, "#16202b");
+            this.sky = sky;
+            this.skyH = screenH;
+            this.skyCtx = ctx;
+        }
+
+        ctx.fillStyle = this.sky;
         ctx.fillRect(0, 0, screenW, screenH);
     }
 
     drawTiles(ctx: CanvasRenderingContext2D, chunks: Record<string, Chunk>): void {
-        Object.values(chunks).forEach((chunk) => {
-            chunk.tiles.forEach((block, index) => {
-                if (block === "air") return;
+        for (const chunkId in chunks) {
+            const chunk = chunks[chunkId];
+            const tiles = chunk.tiles;
+            const baseX = chunk.chunkX * MC2D_CHUNK_SIZE;
+            const baseY = chunk.chunkY * MC2D_CHUNK_SIZE;
+
+            for (let index = 0; index < tiles.length; index += 1) {
+                const block = tiles[index];
+                if (block === "air") continue;
                 const localX = index % MC2D_CHUNK_SIZE;
                 const localY = Math.floor(index / MC2D_CHUNK_SIZE);
-                const tileX = chunk.chunkX * MC2D_CHUNK_SIZE + localX;
-                const tileY = chunk.chunkY * MC2D_CHUNK_SIZE + localY;
+                const tileX = baseX + localX;
+                const tileY = baseY + localY;
                 ctx.fillStyle = blockColor(block);
                 ctx.fillRect(tileX, tileY, 1, 1);
                 ctx.fillStyle = "rgba(0, 0, 0, 0.12)";
                 ctx.fillRect(tileX, tileY, 1, 0.08);
-            });
-        });
+            }
+        }
     }
 
     drawPlayers(ctx: CanvasRenderingContext2D, players: Record<string, ClientPlayerState>, myId: string): void {
-        Object.values(players).forEach((player) => {
+        for (const id in players) {
+            const player = players[id];
             const bodyW = 0.68;
             const bodyH = 1.8;
             ctx.globalAlpha = player.dead ? 0.4 : 1;
@@ -350,7 +334,7 @@ class PixelRenderer {
             ctx.fillStyle = "#22c55e";
             ctx.fillRect(player.x - 0.5, player.y + 1.02, hpRatio, 0.18);
             ctx.globalAlpha = 1;
-        });
+        }
     }
 
     drawMiningTarget(ctx: CanvasRenderingContext2D, target: TilePos | null, reachable: boolean): void {
@@ -484,8 +468,9 @@ export class MinecraftDiamondRushClient extends GameClient {
             jump
         }];
 
-        frameMessages.push(...this.controller.oneShotMessages);
-        this.controller.oneShotMessages = [];
+        const oneShots = this.controller.oneShotMessages;
+        for (let i = 0; i < oneShots.length; i += 1) frameMessages.push(oneShots[i]);
+        oneShots.length = 0;
         return frameMessages;
     }
 
@@ -497,9 +482,15 @@ export class MinecraftDiamondRushClient extends GameClient {
             if (!this.controller.lastMiningTarget || !sameTile(this.controller.lastMiningTarget, pointerTile)) {
                 frameMessages.push({
                     kind: "mine_start",
-                    target: { ...pointerTile }
+                    target: { x: pointerTile.x, y: pointerTile.y }
                 });
-                this.controller.lastMiningTarget = { ...pointerTile };
+                const existing = this.controller.lastMiningTarget;
+                if (existing) {
+                    existing.x = pointerTile.x;
+                    existing.y = pointerTile.y;
+                } else {
+                    this.controller.lastMiningTarget = { x: pointerTile.x, y: pointerTile.y };
+                }
             }
         } else if (this.controller.lastMiningTarget) {
             frameMessages.push({ kind: "mine_stop" });
@@ -509,7 +500,7 @@ export class MinecraftDiamondRushClient extends GameClient {
         if (this.controller.rightClickRequested && pointerTile && this.privateState) {
             frameMessages.push({
                 kind: "place_block",
-                target: { ...pointerTile },
+                target: { x: pointerTile.x, y: pointerTile.y },
                 block: this.privateState.selectedPlaceable
             });
         }
@@ -519,13 +510,14 @@ export class MinecraftDiamondRushClient extends GameClient {
     }
 
     updatePointerState(me: ClientPlayerState | undefined): void {
-        this.controller.pointerTile = this.screenToTile(this.userInput.mouseX, this.userInput.mouseY);
+        this.screenToTileInto(this.userInput.mouseX, this.userInput.mouseY, this.controller.pointerTile);
 
         const pointerTile = this.controller.pointerTile;
-        this.pointerBlock = pointerTile ? this.getBlockAt(pointerTile) : null;
-        if (me && pointerTile) {
-            const center = { x: pointerTile.x + 0.5, y: pointerTile.y + 0.5 };
-            this.pointerReachable = distSq(me, center) <= MC2D_MINING_REACH * MC2D_MINING_REACH;
+        this.pointerBlock = this.getBlockAt(pointerTile);
+        if (me) {
+            const dx = me.x - (pointerTile.x + 0.5);
+            const dy = me.y - (pointerTile.y + 0.5);
+            this.pointerReachable = dx * dx + dy * dy <= MINING_REACH_SQ;
         } else {
             this.pointerReachable = false;
         }
@@ -533,31 +525,40 @@ export class MinecraftDiamondRushClient extends GameClient {
 
     canCraftRecipe(recipeId: string): boolean {
         if (!this.privateState) return false;
-        const recipe = MC2D_RECIPE_BY_ID[recipeId];
-        if (!recipe) return false;
-        const inventory = this.privateState.inventory;
-        return Object.entries(recipe.requires).every(([material, amount]) => {
-            const key = material as keyof typeof inventory;
-            return (inventory[key] as number) >= amount;
-        });
+        if (!MC2D_RECIPE_BY_ID[recipeId]) return false;
+        const requires = RECIPE_REQUIRES[recipeId];
+        if (!requires) return false;
+        const inv = this.privateState.inventory;
+        for (let i = 0; i < requires.length; i += 1) {
+            const [key, amount] = requires[i];
+            if (inv[key] < amount) return false;
+        }
+        return true;
     }
 
     pointerReachable = false;
-    pointerBlock: string | null = null;
+    pointerBlock: BlockType | null = null;
 
     drawPlayerLabels(ctx: CanvasRenderingContext2D, players: Record<string, ClientPlayerState>): void {
         ctx.font = "14px monospace";
         ctx.textAlign = "center";
         ctx.textBaseline = "middle";
-        Object.values(players).forEach((player) => {
-            const screen = this.worldToScreen(player.x, player.y + 1.45);
+        const zoom = this.camera.zoom * MC2D_TILE_SIZE_PX;
+        const cx = this.camera.x;
+        const cy = this.camera.y;
+        const sx0 = this.userInput.screenW / 2;
+        const sy0 = this.userInput.screenH / 2;
+        for (const id in players) {
+            const player = players[id];
+            const screenX = sx0 + (player.x - cx) * zoom;
+            const screenY = sy0 - (player.y + 1.45 - cy) * zoom;
             ctx.fillStyle = "rgba(0, 0, 0, 0.68)";
-            ctx.fillRect(screen.x - 54, screen.y - 16, 108, 16);
+            ctx.fillRect(screenX - 54, screenY - 16, 108, 16);
             ctx.fillStyle = "#f8fafc";
-            ctx.fillText(player.name, screen.x, screen.y - 8);
+            ctx.fillText(player.name, screenX, screenY - 8);
             ctx.fillStyle = "#ffffff";
-            ctx.fillText(`${Math.ceil(player.hp)} HP`, screen.x, screen.y - 24);
-        });
+            ctx.fillText(`${Math.ceil(player.hp)} HP`, screenX, screenY - 24);
+        }
     }
 
     drawTopInfo(ctx: CanvasRenderingContext2D, me: ClientPlayerState | undefined): void {
@@ -597,11 +598,10 @@ export class MinecraftDiamondRushClient extends GameClient {
         ctx.fillText("Recipes", panelX + 12, panelY + 38);
 
         let cursorY = panelY + 64;
-        MC2D_RECIPES.forEach((recipe) => {
+        for (let i = 0; i < MC2D_RECIPES.length; i += 1) {
+            const recipe = MC2D_RECIPES[i];
             const craftable = this.canCraftRecipe(recipe.id);
-            const materials = Object.entries(recipe.requires)
-                .map(([material, amount]) => `${formatMaterialName(material)} x${amount}`)
-                .join("  ");
+            const materials = RECIPE_MATERIALS_TEXT[recipe.id] ?? "";
             ctx.fillStyle = craftable ? "rgba(34, 197, 94, 0.14)" : "rgba(255, 255, 255, 0.06)";
             ctx.fillRect(panelX + 8, cursorY - 2, panelW - 16, 44);
             ctx.fillStyle = craftable ? "#86efac" : "#f8fafc";
@@ -611,7 +611,7 @@ export class MinecraftDiamondRushClient extends GameClient {
             ctx.fillStyle = "#cbd5e1";
             ctx.fillText(materials, panelX + 12, cursorY + 16);
             cursorY += 50;
-        });
+        }
 
         cursorY += 8;
         ctx.fillStyle = "#f8fafc";
@@ -620,20 +620,7 @@ export class MinecraftDiamondRushClient extends GameClient {
 
         ctx.font = "12px monospace";
         ctx.fillStyle = "#cbd5e1";
-        const controls = [
-            "A/D move",
-            "W or Space jump",
-            "Mouse aim",
-            "left click mine",
-            "right click place",
-            "F attack",
-            "Z/X/C select block",
-            "1-5 craft"
-        ];
-
-        controls.forEach((line, index) => {
-            ctx.fillText(line, panelX + 12, cursorY + 20 + index * 16);
-        });
+        for (let i = 0; i < BASE_CONTROLS.length; i += 1) ctx.fillText(BASE_CONTROLS[i], panelX + 12, cursorY + 20 + i * 16);
     }
 
     drawHotbar(ctx: CanvasRenderingContext2D): void {
@@ -697,7 +684,9 @@ export class MinecraftDiamondRushClient extends GameClient {
         ctx.fillText(label, x + 8, y - 20);
         ctx.fillText(reachableText, x + 8, y - 2);
         if (!this.pointerReachable && me) {
-            const dist = Math.sqrt(distSq(me, { x: this.controller.pointerTile.x + 0.5, y: this.controller.pointerTile.y + 0.5 }));
+            const dx = me.x - (this.controller.pointerTile.x + 0.5);
+            const dy = me.y - (this.controller.pointerTile.y + 0.5);
+            const dist = Math.sqrt(dx * dx + dy * dy);
             ctx.fillText(`dist ${dist.toFixed(2)}`, x + 120, y - 2);
         }
     }
@@ -745,67 +734,32 @@ export class MinecraftDiamondRushClient extends GameClient {
         this.matchEndsAtMs = snapshot.matchEndsAtMs;
         this.summary = snapshot.summary;
         this.privateState = snapshot.self;
-        this.diamondPos = snapshot.diamondPos ? { ...snapshot.diamondPos } : this.diamondPos;
-        this.syncPlayers(snapshot.players);
-        Object.keys(this.chunks).forEach((key) => delete this.chunks[key]);
-        snapshot.chunks.forEach((chunk) => {
-            this.chunks[chunkKey(chunk.chunkX, chunk.chunkY)] = {
-                chunkX: chunk.chunkX,
-                chunkY: chunk.chunkY,
-                tiles: [...chunk.tiles]
-            };
-        });
+        this.diamondPos = snapshot.diamondPos ?? this.diamondPos;
+        this.interpolator.sync(snapshot.players);
+        this.chunks = {};
+        for (let i = 0; i < snapshot.chunks.length; i += 1) {
+            const chunk = snapshot.chunks[i];
+            this.chunks[chunkKey(chunk.chunkX, chunk.chunkY)] = chunk;
+        }
     }
 
     applyDelta(delta: GameDelta): void {
         this.matchEndsAtMs = delta.matchEndsAtMs;
         this.summary = delta.summary;
-        this.diamondPos = delta.diamondPos ? { ...delta.diamondPos } : this.diamondPos;
+        this.diamondPos = delta.diamondPos ?? this.diamondPos;
         if (delta.self) this.privateState = delta.self;
-        this.syncPlayers(delta.players);
-        delta.blockUpdates.forEach((update) => {
-            this.applyBlockUpdate(update);
-        });
-    }
-
-    syncPlayers(networkPlayers: Record<string, PublicPlayerState>): void {
-        Object.entries(networkPlayers).forEach(([id, incoming]) => {
-            const existing = this.interpolator.players[id];
-            if (!existing) {
-                this.interpolator.players[id] = {
-                    ...incoming,
-                    targetX: incoming.x,
-                    targetY: incoming.y
-                };
-                return;
-            }
-
-            existing.name = incoming.name;
-            existing.skin = incoming.skin;
-            existing.vx = incoming.vx;
-            existing.vy = incoming.vy;
-            existing.facing = incoming.facing;
-            existing.hp = incoming.hp;
-            existing.maxHp = incoming.maxHp;
-            existing.dead = incoming.dead;
-            existing.targetX = incoming.x;
-            existing.targetY = incoming.y;
-        });
-
-        Object.keys(this.interpolator.players).forEach((id) => {
-            if (!networkPlayers[id]) {
-                delete this.interpolator.players[id];
-            }
-        });
+        this.interpolator.sync(delta.players);
+        for (let i = 0; i < delta.blockUpdates.length; i += 1) this.applyBlockUpdate(delta.blockUpdates[i]);
     }
 
     applyBlockUpdate(update: { pos: TilePos; block: BlockType }): void {
-        const coords = chunkCoordFromTile(update.pos.x, update.pos.y);
-        const key = chunkKey(coords.chunkX, coords.chunkY);
+        const chunkX = floorDiv(update.pos.x, MC2D_CHUNK_SIZE);
+        const chunkY = floorDiv(update.pos.y, MC2D_CHUNK_SIZE);
+        const key = chunkKey(chunkX, chunkY);
         if (!this.chunks[key]) {
             this.chunks[key] = {
-                chunkX: coords.chunkX,
-                chunkY: coords.chunkY,
+                chunkX,
+                chunkY,
                 tiles: new Array(MC2D_CHUNK_SIZE * MC2D_CHUNK_SIZE).fill("air")
             };
         }
@@ -814,37 +768,26 @@ export class MinecraftDiamondRushClient extends GameClient {
         this.chunks[key].tiles[index] = update.block;
     }
 
-    getBlockAt(tile: TilePos): string | null {
-        const coords = chunkCoordFromTile(tile.x, tile.y);
-        const key = chunkKey(coords.chunkX, coords.chunkY);
+    getBlockAt(tile: TilePos): BlockType | null {
+        const chunkX = floorDiv(tile.x, MC2D_CHUNK_SIZE);
+        const chunkY = floorDiv(tile.y, MC2D_CHUNK_SIZE);
+        const key = chunkKey(chunkX, chunkY);
         const chunk = this.chunks[key];
         if (!chunk) return null;
         const index = localTileIndex(tile.x, tile.y);
         return chunk.tiles[index] ?? null;
     }
 
-    screenToTile(screenX: number, screenY: number): TilePos {
+    screenToTileInto(screenX: number, screenY: number, out: TilePos): TilePos {
         const worldX = (screenX - this.userInput.screenW / 2)
             / (MC2D_TILE_SIZE_PX * this.camera.zoom)
             + this.camera.x;
         const worldY = -((screenY - this.userInput.screenH / 2)
             / (MC2D_TILE_SIZE_PX * this.camera.zoom))
             + this.camera.y;
-        return {
-            x: Math.floor(worldX),
-            y: Math.floor(worldY)
-        };
-    }
-
-    worldToScreen(worldX: number, worldY: number): { x: number; y: number } {
-        const screenX = this.userInput.screenW / 2
-            + (worldX - this.camera.x) * this.camera.zoom * MC2D_TILE_SIZE_PX;
-        const screenY = this.userInput.screenH / 2
-            - (worldY - this.camera.y) * this.camera.zoom * MC2D_TILE_SIZE_PX;
-        return {
-            x: screenX,
-            y: screenY
-        };
+        out.x = Math.floor(worldX);
+        out.y = Math.floor(worldY);
+        return out;
     }
 
     drawGearSlot(
@@ -879,24 +822,16 @@ export class MinecraftDiamondRushClient extends GameClient {
     }
 }
 
-const blockColor = (block: string): string => {
-    if (block === "grass") return "#6cab4f";
-    if (block === "dirt") return "#7d5a3a";
-    if (block === "trunk") return "#8a5b36";
-    if (block === "stone") return "#8c96a0";
-    if (block === "iron_ore") return "#b77f50";
-    if (block === "diamond") return "#2bc4d1";
-    return "#111827";
-};
-
-const formatMaterialName = (material: string): string => {
-    if (material === "wood") return "Wood";
-    if (material === "stone") return "Stone";
-    if (material === "trunk") return "Trunk";
-    if (material === "iron") return "Iron";
-    if (material === "dirt") return "Dirt";
-    if (material === "diamond") return "Diamond";
-    return material;
+const blockColor = (block: BlockType): string => {
+    switch (block) {
+        case "grass": return "#6cab4f";
+        case "dirt": return "#7d5a3a";
+        case "trunk": return "#8a5b36";
+        case "stone": return "#8c96a0";
+        case "iron_ore": return "#b77f50";
+        case "diamond": return "#2bc4d1";
+        default: return "#111827";
+    }
 };
 
 const isSlotSelected = (inventoryKey: string, selectedPlaceable: PlaceableBlock): boolean => {
